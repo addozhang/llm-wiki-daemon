@@ -46,7 +46,7 @@ Markdown pages sits between you and your immutable sources, and the LLM owns it.
 ## Quick start
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/addozhang/llm-wiki-daemon.git
 cd llm-wiki-daemon
 cp config.example.toml config.toml
 # edit the three absolute paths in config.toml

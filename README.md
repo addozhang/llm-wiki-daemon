@@ -120,7 +120,7 @@ new page has no link name yet.
 
 | Tool | Arguments | Purpose |
 | --- | --- | --- |
-| `vault_search` | `query, layer?, status?, limit?` | Weighted FTS5 + CJK trigram + substring fallback; returns ready-to-feed `target` and a short `snippet` with `**highlighted**` matches |
+| `vault_search` | `query, layer?, status?, limit?` | Weighted FTS5 + CJK trigram + substring fallback, fused by RRF rank; returns ready-to-feed `target`, a short `snippet` with `**highlighted**` matches, `score` (RRF, higher = better) and `bm25` (raw, per-index) |
 | `vault_read` | `target` | Standard fields, `frontmatter_all`, body, `version`, and resolved `links` |
 | `vault_resolve` | `targets[]` | Batch preview: metadata only, no body. Ambiguity gives `candidates[]` |
 | `vault_status` | — | Index counts, `link_refs`, `wiki_root`, mode, watcher counters |
@@ -129,6 +129,18 @@ new page has no link name yet.
 | `vault_append` | `target, text, expected_version, heading?` | Append at end or under a heading |
 | `vault_create` | `path, kind, sources[], summary, text?, title?, confidence?` | Bootstrap a new wiki page with verifiable provenance |
 | `vault_rewrite` | `target, expected_version, reason, text?, heading?, summary?, sources[]?, related[]?, supersedes[]?` | Revise or re-compile; may delete wrong entries |
+
+### Search ranking
+
+`vault_search` runs up to three retrieval paths — weighted FTS5 (`unicode61`,
+good for Latin), a parallel `trigram` FTS5 index (for CJK), and an exact
+substring scan (recall backstop) — then fuses their ranked lists with
+**Reciprocal Rank Fusion** (`score = Σ weight/(60 + rank)`, weights 1 / 1 / 0.1).
+Fusion is by rank, not raw score, because the two FTS tables have
+non-comparable IDF statistics. The result's `score` is the RRF value (higher
+= more relevant); `bm25` keeps the raw per-index value for debugging. The
+`snippet` is a bounded, `**highlighted**` context window around the first
+match, generated identically for all three paths.
 
 ### Write gateway
 

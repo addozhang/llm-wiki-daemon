@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
-use std::collections::{HashSet, hash_map::DefaultHasher};
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -19,7 +19,13 @@ pub struct SearchHit {
     pub status: String,
     pub tags: String,
     pub date: String,
+    /// RRF fusion score for cross-index ranking (higher = more relevant).
+    /// Ranks, not raw bm25, are fused because the unicode61 and trigram
+    /// tables have non-comparable IDF statistics.
     pub score: f64,
+    /// Original bm25 from whichever index first surfaced this note (negative
+    /// = more relevant). Kept for debugging; not comparable across indexes.
+    pub bm25: f64,
     /// Bounded context window around the first match, with **highlight**.
     /// Lets the agent decide relevance without a full vault_read.
     pub snippet: String,
@@ -208,6 +214,44 @@ fn make_snippet(body: &str, query: &str, max_chars: usize) -> String {
         out.push('…');
     }
     out
+}
+
+/// Reciprocal Rank Fusion constant. Borrowed from the standard RRF formula.
+const RRF_K: f64 = 60.0;
+
+/// Fuse several ranked result lists into one ordering by RANK, not by score.
+///
+/// The unicode61 and trigram FTS tables have different IDF statistics, so a
+/// bm25 of -7 in one is not comparable to -7 in the other. RRF sidesteps this:
+/// a hit's contribution is `weight / (K + rank)`, which only depends on where
+/// it placed in each list. The substring fallback is down-weighted so it can
+/// top up recall without outranking a real index hit.
+fn rrf_fuse(lists: &[(Vec<SearchHit>, f64)], limit: usize) -> Vec<SearchHit> {
+    let mut fused: HashMap<String, (SearchHit, f64)> = HashMap::new();
+    for (hits, weight) in lists {
+        for (rank, hit) in hits.iter().enumerate() {
+            let contribution = weight / (RRF_K + rank as f64 + 1.0);
+            match fused.get_mut(&hit.path) {
+                Some((_, total)) => *total += contribution,
+                None => {
+                    fused.insert(hit.path.clone(), (hit.clone(), contribution));
+                }
+            }
+        }
+    }
+    let mut out: Vec<(SearchHit, f64)> = fused.into_values().collect();
+    // Higher fused score first; stable tie-break on path for determinism.
+    out.sort_by(|a, b| {
+        b.1.total_cmp(&a.1)
+            .then_with(|| a.0.path.cmp(&b.0.path))
+    });
+    out.into_iter()
+        .take(limit)
+        .map(|(mut hit, fused_score)| {
+            hit.score = fused_score;
+            hit
+        })
+        .collect()
 }
 
 /// Collect whole Obsidian wikilinks from prose, verbatim (`[[Note|alias]]`).
@@ -722,6 +766,7 @@ impl VaultIndex {
             let path: String = r.get(0)?;
             let target = format!("[[{}]]", path.strip_suffix(".md").unwrap_or(&path));
             let body: String = r.get(8)?;
+            let raw_score: f64 = r.get(7)?;
             Ok(SearchHit {
                 path,
                 target,
@@ -731,7 +776,8 @@ impl VaultIndex {
                 status: r.get(4)?,
                 tags: r.get(5)?,
                 date: r.get(6)?,
-                score: r.get(7)?,
+                score: 0.0, // filled by rrf_fuse
+                bm25: raw_score,
                 snippet: make_snippet(&body, query, 120),
             })
         })?;
@@ -777,14 +823,14 @@ impl VaultIndex {
                      AND (?3 IS NULL OR status = ?3)
                    ORDER BY score
                    LIMIT ?4";
-        let mut hits = Self::rows_from_match(&conn, sql, &fts, query, layer, status, limit)?;
-        let mut seen: HashSet<String> = hits.iter().map(|h| h.path.clone()).collect();
+        // Each retrieval path produces its own ranked list. RRF then fuses
+        // them by rank, so cross-index score comparability is irrelevant.
+        let primary = Self::rows_from_match(&conn, sql, &fts, query, layer, status, limit)?;
+        let mut lists: Vec<(Vec<SearchHit>, f64)> = vec![(primary, 1.0)];
 
         // P2: trigram tokeniser segments CJK, so a Chinese query that gets no
-        // (or weak) unicode61 ranking is re-run on the parallel trigram index
-        // to obtain a meaningful score ordering. Only for CJK input, and only
-        // when there is room left, so Latin behaviour is byte-for-byte intact.
-        if has_cjk(query) && hits.len() < limit as usize {
+        // (or weak) unicode61 ranking is re-run on the parallel trigram index.
+        if has_cjk(query) {
             let tri_sql = "SELECT path, title, summary, layer, status, tags, date,
                                   bm25(notes_tri, 0.0, 10.0, 6.0, 3.0, 1.0, 0.0, 0.0, 0.0, 0.0) AS score,
                                   body
@@ -794,42 +840,26 @@ impl VaultIndex {
                              AND (?3 IS NULL OR status = ?3)
                            ORDER BY score
                            LIMIT ?4";
-            let extra =
-                Self::rows_from_match(&conn, tri_sql, &fts, query, layer, status, limit)?;
-            for hit in extra {
-                if hits.len() >= limit as usize {
-                    break;
-                }
-                if seen.insert(hit.path.clone()) {
-                    hits.push(hit);
-                }
-            }
+            let tri = Self::rows_from_match(&conn, tri_sql, &fts, query, layer, status, limit)?;
+            lists.push((tri, 1.0));
         }
 
-        // unicode61 (even with trigram help) can still miss substring matches;
-        // top up with an exact instr() scan so CJK queries never lose hits.
-        // `instr()` needs no wildcard escaping, so % _ or \ in the query behave
-        // literally instead of matching the whole vault. Score 0.0 keeps these
-        // below the ranked hits.
-        if hits.len() < limit as usize {
-            let sql = "SELECT path, title, summary, layer, status, tags, date, 0.0 AS score, body
-                       FROM notes
-                       WHERE (instr(title, ?1) > 0 OR instr(summary, ?1) > 0
-                           OR instr(tags, ?1) > 0 OR instr(body, ?1) > 0)
-                         AND (?2 IS NULL OR layer = ?2)
-                         AND (?3 IS NULL OR status = ?3)
-                       LIMIT ?4";
-            let extra = Self::rows_from_match(&conn, sql, query, query, layer, status, limit)?;
-            for hit in extra {
-                if hits.len() >= limit as usize {
-                    break;
-                }
-                if seen.insert(hit.path.clone()) {
-                    hits.push(hit);
-                }
-            }
-        }
-        Ok(hits)
+        // unicode61 (even with trigram help) can miss substring matches; an
+        // exact instr() scan tops up recall. Down-weighted in RRF (0.1) so a
+        // substring hit never outranks a real index hit. `instr()` needs no
+        // wildcard escaping, so % _ or \ behave literally.
+        let fallback_sql = "SELECT path, title, summary, layer, status, tags, date, 0.0 AS score, body
+                            FROM notes
+                            WHERE (instr(title, ?1) > 0 OR instr(summary, ?1) > 0
+                                OR instr(tags, ?1) > 0 OR instr(body, ?1) > 0)
+                              AND (?2 IS NULL OR layer = ?2)
+                              AND (?3 IS NULL OR status = ?3)
+                            LIMIT ?4";
+        let fallback =
+            Self::rows_from_match(&conn, fallback_sql, query, query, layer, status, limit)?;
+        lists.push((fallback, 0.1));
+
+        Ok(rrf_fuse(&lists, limit as usize))
     }
 
     /// Read one note addressed by an Obsidian wikilink (or a bare name / path).
@@ -1153,6 +1183,29 @@ mod tests {
             ),
         )
         .unwrap();
+        // Both concepts in title/summary: strong on BOTH the unicode61 path
+        // (OpenTelemetry) and the trigram path (插桩).
+        std::fs::write(
+            root.join("双概念.md"),
+            note(
+                "双概念.md",
+                "OpenTelemetry 自动插桩",
+                "Auto-instrumentation using OpenTelemetry",
+                "OpenTelemetry 的自动插桩可以在不修改代码的情况下采集遥测数据。",
+            ),
+        )
+        .unwrap();
+        // Only the Latin word: strong on unicode61, absent from trigram list.
+        std::fs::write(
+            root.join("仅英文.md"),
+            note(
+                "仅英文.md",
+                "OpenTelemetry Collector",
+                "Collecting telemetry data",
+                "The OpenTelemetry Collector receives and exports telemetry data in pipelines.",
+            ),
+        )
+        .unwrap();
         let idx = VaultIndex::open(root.clone(), &root.join("index.sqlite"), vec![], "AGENTS.md")
             .unwrap();
         idx.rebuild().unwrap();
@@ -1208,5 +1261,48 @@ mod tests {
         // its body. The exact phrase in summary should outrank a body mention.
         let hits = idx.search("Persistent volumes", None, None, 10).unwrap();
         assert_eq!(hits.first().map(|h| h.path.as_str()), Some("存储卷.md"));
+    }
+
+    #[test]
+    fn rrf_fuses_mixed_cjk_latin_query() {
+        let (_dir, idx) = fixture();
+        // "OpenTelemetry" ranks on the unicode61 path, "插桩" on the trigram
+        // path. 双概念.md wins on both, so RRF must put it first even though
+        // neither single path sees the full query.
+        let hits = idx.search("OpenTelemetry 插桩", None, None, 10).unwrap();
+        assert_eq!(
+            hits.first().map(|h| h.path.as_str()),
+            Some("双概念.md"),
+            "RRF should surface the page matching both concepts first"
+        );
+        // A Latin-only page must still be present (from the primary list).
+        assert!(
+            hits.iter().any(|h| h.path == "仅英文.md"),
+            "Latin-only page must survive fusion"
+        );
+    }
+
+    #[test]
+    fn score_is_rrf_and_bm25_is_preserved() {
+        let (_dir, idx) = fixture();
+        let hits = idx.search("网络策略", None, None, 10).unwrap();
+        let top = &hits[0];
+        assert!(
+            top.score > 0.0,
+            "RRF score should be a positive fused value, got {}",
+            top.score
+        );
+        assert!(
+            top.bm25 < 0.0,
+            "original bm25 should be preserved (negative), got {}",
+            top.bm25
+        );
+        // RRF scores must be monotonically non-increasing across the list.
+        for w in hits.windows(2) {
+            assert!(
+                w[0].score >= w[1].score,
+                "hits must be sorted by descending RRF score"
+            );
+        }
     }
 }

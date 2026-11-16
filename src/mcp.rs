@@ -93,7 +93,7 @@ impl VaultServer {
         }
     }
 
-    #[tool(description = "Search vault notes through the derived index (FTS5 + CJK trigram + substring fallback). Returns path, title, summary, layer, status, tags, date, score and a short snippet with **highlighted** matches for relevance triage. Prefer several precise short queries over one long sentence; use layer/status to narrow scope.")]
+    #[tool(description = "Search vault notes through the derived index (FTS5 + CJK trigram + substring fallback), fused by RRF rank. Returns path, title, summary, layer, status, tags, date, score (RRF, higher = more relevant), bm25 (raw per-index value) and a short snippet with **highlighted** matches for relevance triage. Prefer several precise short queries over one long sentence; use layer/status to narrow scope.")]
     async fn vault_search(
         &self,
         Parameters(req): Parameters<SearchRequest>,

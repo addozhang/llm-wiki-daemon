@@ -1,0 +1,18 @@
+# Optional overlay for dsh (dshcli) one-shot headless runs.
+# Mounts ONE MCP client that talks to LLM Wiki Daemon over Streamable HTTP.
+# This file does not modify any profile: pass it with `--patch <this file>`.
+#
+# Usage:
+#   dsh --profile headless --patch <this file> --approval-policy never --json "<task>"
+#
+# The headless app reads its provider credential from the launching environment.
+# NO credential value is stored in this file or in the repo.
+- insert:
+    - id: mcp-llm-wiki
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: llm_wiki
+        transport: streamable-http
+        url: http://127.0.0.1:8788/mcp
+        headers:
+          Origin: http://127.0.0.1:8788

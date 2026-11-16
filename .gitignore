@@ -1,0 +1,14 @@
+/target/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.DS_Store
+
+# Local configuration (contains machine-specific absolute paths).
+# Copy config.example.toml to config.toml and edit it for your machine.
+config.toml
+
+# Local install copies / secrets
+*.local.*
+.env
+.env.*

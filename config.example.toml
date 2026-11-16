@@ -1,0 +1,56 @@
+# Example configuration. Copy to config.toml and replace the three absolute
+# paths with real directories on your machine. config.toml is gitignored.
+# Start the daemon with: llm-wiki-daemon config.toml
+#
+# All paths must be absolute. `vault.root` must exist and be a directory;
+# the index DB and log directories are created automatically.
+
+[server]
+bind = "127.0.0.1"
+port = 8788
+allow_non_loopback = false
+
+[auth]
+token_env = "LLM_WIKI_DAEMON_TOKEN"
+required_when_non_loopback = true
+
+[security]
+allowed_hosts = ["127.0.0.1:8788", "localhost:8788"]
+# When this list is non-empty, EVERY request must carry an allowed Origin
+# header; a missing one is rejected. Sec-Fetch-Site: cross-site is rejected
+# in the same branch. Both configured harnesses send it.
+# Clearing the list allows Origin-less clients AND disables the cross-site
+# check; it protects only browser cross-site requests, not local processes.
+# For local-process isolation, set [writes] require_token = true.
+allowed_origins = ["http://127.0.0.1:8788"]
+deny_paths = ["归档/", ".obsidian/", ".git/", ".workbuddy/", "附件/Templates/"]
+
+[vault]
+root = "/absolute/path/to/your/vault"
+schema = "AGENTS.md"
+index_db = "/absolute/path/to/state/index.sqlite"
+
+[watcher]
+enabled = true
+debounce_ms = 200
+
+# Vault-relative directory that owns every wiki page. All write operations
+# (create / patch / append / rewrite) are restricted to this subtree AND to
+# pages whose frontmatter says `layer: wiki`. Changing this value requires
+# moving existing wiki pages, otherwise they become read-only.
+[wiki]
+root = "wiki"
+
+# Writes are ON but scoped by the store to `layer: wiki` pages only.
+# `enabled` is now an emergency kill switch, not a daily toggle.
+# Set require_token = true only when you want an extra gate; the daemon
+# then refuses to start unless LLM_WIKI_DAEMON_TOKEN is present.
+[writes]
+enabled = true
+require_token = false
+
+# Daemon-owned logs live OUTSIDE the vault: daily-rotated daemon.log plus a
+# structured append-only audit.jsonl for every create / patch / append / rewrite.
+[logging]
+dir = "/absolute/path/to/logs/llm-wiki-daemon"
+audit_max_bytes = 8388608

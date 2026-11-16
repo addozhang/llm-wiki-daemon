@@ -1,0 +1,30 @@
+{
+  "_comment": "LLM Wiki Daemon — reference only. Copy the relevant block into your harness config; do not put tokens in this file or in the vault.",
+  "opencode": {
+    "_where": "~/.config/opencode/opencode.json, under the top-level \"mcp\" key",
+    "mcp": {
+      "llm-wiki": {
+        "type": "remote",
+        "url": "http://127.0.0.1:8788/mcp",
+        "headers": {
+          "Origin": "http://127.0.0.1:8788"
+        }
+      }
+    }
+  },
+  "dsh_headless": {
+    "_where": "dsh --profile headless --patch <project>/dsh/llm-wiki.patch.yml --approval-policy never --json \"<task>\"",
+    "_note": "Verified 2026-11-15. dsh-mcp-client supports streamable-http directly, so NO stdio bridge is needed. Tools are exposed as mcp__llm_wiki__<tool>. The headless app reads its provider credential from the launching environment; no credential value is stored in this repo. Session contract is delivered via MCP `instructions` on initialize — no global stub needed.",
+    "_credential_env": "DEEPSEEK_API_KEY — read from the launching environment at runtime; never stored in this repo, in the vault, or in any config file",
+    "verified_tools": ["mcp__llm_wiki__vault_status", "mcp__llm_wiki__vault_search"],
+    "tool_surface": ["vault_status", "vault_search", "vault_read", "vault_resolve", "vault_lint", "vault_patch", "vault_append", "vault_create", "vault_rewrite"],
+    "_addressing": "All tools except vault_create take `target` (an Obsidian wikilink such as [[Note]]); `path` is a legacy alias. vault_create.path is the location of the NEW page. vault_patch uses `part` (frontmatter|section|end), not `target`, for the part to change."
+  },
+  "with_token_example": {
+    "_comment": "Set LLM_WIKI_DAEMON_TOKEN in your shell, then add this header.",
+    "headers": {
+      "Authorization": "Bearer ${LLM_WIKI_DAEMON_TOKEN}",
+      "Origin": "http://127.0.0.1:8788"
+    }
+  }
+}

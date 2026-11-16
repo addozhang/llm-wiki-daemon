@@ -93,7 +93,7 @@ impl VaultServer {
         }
     }
 
-    #[tool(description = "Search vault notes through the derived FTS5 index. Returns path, title, summary, layer, status, tags and date.")]
+    #[tool(description = "Search vault notes through the derived index (FTS5 + CJK trigram + substring fallback). Returns path, title, summary, layer, status, tags, date, score and a short snippet with **highlighted** matches for relevance triage. Prefer several precise short queries over one long sentence; use layer/status to narrow scope.")]
     async fn vault_search(
         &self,
         Parameters(req): Parameters<SearchRequest>,
@@ -243,8 +243,8 @@ impl VaultServer {
     instructions = "LLM Wiki Daemon — 人机共享的 Markdown 知识库。vault 是唯一真相源，SQLite 索引是可随时重建的派生缓存；机器检索只走下列工具，不存在需要整份阅读的静态目录文件。
 
 【默认：Query，只读】
-1. 先看已编译结论：vault_search(query, layer=wiki)；不够再回退全库 raw/note。
-2. 用 vault_resolve 预览命中项，以及 vault_read 返回的 links / frontmatter_all.sources（均为 wikilink 数组），按一行摘要判断相关性，只对选中的原始 wikilink 调 vault_read；默认只展开一层、不递归。
+1. 先看已编译结论：vault_search(query, layer=wiki)；不够再回退全库 raw/note。查询策略：中文或长句先拆成 2-4 个精确短词分别搜、再合并去重，别把整句丢进一次 query；已知归属时用 layer / status 收窄范围，能显著降低无关召回。
+2. 用 vault_resolve 预览命中项，以及 vault_read 返回的 links / frontmatter_all.sources（均为 wikilink 数组），按命中片段 snippet（**高亮**了命中词）和一行摘要判断相关性，只对选中的原始 wikilink 调 vault_read；默认只展开一层、不递归。snippet 只是定位线索、上下文有限，下结论前仍须 vault_read 全文，不要仅凭 snippet 回答。
 3. 回答带 [[引用]]（vault 相对路径）。
 4. 收尾自检：本次是否产生了综合、对比、纠错、决策或新的因果联系？若有，向人提议「是否回写为 wiki 页」，经确认才写。默认不写 —— 不要把每次问答都写进 wiki，也不要让有价值的结论只留在对话里。
 

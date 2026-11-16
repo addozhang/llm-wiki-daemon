@@ -20,6 +20,9 @@ pub struct SearchHit {
     pub tags: String,
     pub date: String,
     pub score: f64,
+    /// Bounded context window around the first match, with **highlight**.
+    /// Lets the agent decide relevance without a full vault_read.
+    pub snippet: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -134,6 +137,77 @@ pub fn content_hash(s: &str) -> String {
     let mut h = DefaultHasher::new();
     s.hash(&mut h);
     format!("{:016x}", h.finish())
+}
+
+/// Detect CJK code points in a query. Trigram tokenisation only helps for
+/// these; Latin queries stay on the original unicode61 + substring path.
+fn has_cjk(s: &str) -> bool {
+    s.chars().any(|c| {
+        ('\u{3400}'..='\u{9fff}').contains(&c)   // CJK Unified (incl. Ext A)
+            || ('\u{f900}'..='\u{faff}').contains(&c) // Compatibility Ideographs
+            || ('\u{3040}'..='\u{30ff}').contains(&c) // Hiragana / Katakana
+            || ('\u{ac00}'..='\u{d7af}').contains(&c) // Hangul
+    })
+}
+
+/// Bounded context window around the first matching term in a note body.
+/// Generated in Rust rather than via FTS5 `snippet()` so every retrieval path
+/// (FTS5, trigram, substring fallback) produces the same shape of evidence,
+/// and so CJK matches — which unicode61 cannot tokenise — still get a window.
+/// ASCII case-insensitive; CJK compared literally. Output is whitespace-flat
+/// and capped at `max_chars` characters (characters, not bytes).
+fn make_snippet(body: &str, query: &str, max_chars: usize) -> String {
+    let flat: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return String::new();
+    }
+    let lower = flat.to_lowercase();
+    // Prefer the longest quoted phrase, then individual words: find the
+    // earliest occurrence among all query terms.
+    let mut best: Option<(usize, usize)> = None; // (byte offset, term length)
+    let terms: Vec<&str> = query
+        .split_whitespace()
+        .filter(|w| !w.is_empty())
+        .collect();
+    for term in &terms {
+        let needle = term.to_lowercase();
+        if needle.is_empty() {
+            continue;
+        }
+        if let Some(pos) = lower.find(&needle) {
+            if best.is_none_or(|(b, _)| pos < b) {
+                best = Some((pos, needle.len()));
+            }
+        }
+    }
+    let chars: Vec<char> = flat.chars().collect();
+    let (start, end, hit) = match best {
+        Some((byte_pos, term_len)) => {
+            let center = flat[..byte_pos].chars().count();
+            let half = max_chars / 2;
+            let s = center.saturating_sub(half);
+            let e = (center + term_len.max(max_chars / 2)).min(chars.len());
+            (s, e, Some((center, center + flat[byte_pos..byte_pos + term_len].chars().count())))
+        }
+        None => (0, chars.len().min(max_chars), None),
+    };
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    for (i, c) in chars[start..end].iter().enumerate() {
+        if hit.is_some_and(|(hs, _)| start + i == hs) {
+            out.push_str("**");
+        }
+        out.push(*c);
+        if hit.is_some_and(|(_, he)| start + i + 1 == he) {
+            out.push_str("**");
+        }
+    }
+    if end < chars.len() {
+        out.push('…');
+    }
+    out
 }
 
 /// Collect whole Obsidian wikilinks from prose, verbatim (`[[Note|alias]]`).
@@ -352,6 +426,7 @@ impl VaultIndex {
         let mut conn = self.conn.lock().unwrap();
         conn.execute_batch(
             "DROP TABLE IF EXISTS notes;
+             DROP TABLE IF EXISTS notes_tri;
              DROP TABLE IF EXISTS note_meta;
              DROP TABLE IF EXISTS refs;
              CREATE VIRTUAL TABLE notes USING fts5(
@@ -360,6 +435,13 @@ impl VaultIndex {
                  layer UNINDEXED, status UNINDEXED, date UNINDEXED,
                  hash UNINDEXED,
                  tokenize = 'unicode61 remove_diacritics 2'
+             );
+             CREATE VIRTUAL TABLE notes_tri USING fts5(
+                 path UNINDEXED,
+                 title, summary, tags, body,
+                 layer UNINDEXED, status UNINDEXED, date UNINDEXED,
+                 hash UNINDEXED,
+                 tokenize = 'trigram'
              );
              CREATE TABLE note_meta (
                  path TEXT PRIMARY KEY,
@@ -400,6 +482,11 @@ impl VaultIndex {
                  (path, title, summary, tags, body, layer, status, date, hash)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
+            let mut ins_tri = tx.prepare(
+                "INSERT INTO notes_tri
+                 (path, title, summary, tags, body, layer, status, date, hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
             let mut ins_meta = tx.prepare(
                 "INSERT OR REPLACE INTO note_meta
                  (path, title, summary, layer, status, kind, hash)
@@ -428,6 +515,17 @@ impl VaultIndex {
                 let (fm, body) = parse_note(&text);
                 let hash = content_hash(&text);
                 ins_notes.execute(params![
+                    rel,
+                    fm.title,
+                    fm.summary,
+                    fm.tags.join(", "),
+                    body,
+                    fm.layer,
+                    fm.status,
+                    fm.date,
+                    hash,
+                ])?;
+                ins_tri.execute(params![
                     rel,
                     fm.title,
                     fm.summary,
@@ -504,6 +602,7 @@ impl VaultIndex {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 let tx = conn.transaction()?;
                 let n = tx.execute("DELETE FROM notes WHERE path = ?1", params![rel])?;
+                tx.execute("DELETE FROM notes_tri WHERE path = ?1", params![rel])?;
                 tx.execute("DELETE FROM note_meta WHERE path = ?1", params![rel])?;
                 tx.execute("DELETE FROM refs WHERE path = ?1", params![rel])?;
                 tx.commit()?;
@@ -532,10 +631,26 @@ impl VaultIndex {
         let (fm, body) = parse_note(&text);
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM notes WHERE path = ?1", params![rel])?;
+        tx.execute("DELETE FROM notes_tri WHERE path = ?1", params![rel])?;
         tx.execute("DELETE FROM note_meta WHERE path = ?1", params![rel])?;
         tx.execute("DELETE FROM refs WHERE path = ?1", params![rel])?;
         tx.execute(
             "INSERT INTO notes (path, title, summary, tags, body, layer, status, date, hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                rel,
+                fm.title,
+                fm.summary,
+                fm.tags.join(", "),
+                body,
+                fm.layer,
+                fm.status,
+                fm.date,
+                hash,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO notes_tri (path, title, summary, tags, body, layer, status, date, hash)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 rel,
@@ -578,6 +693,7 @@ impl VaultIndex {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let n = tx.execute("DELETE FROM notes WHERE path = ?1", params![rel])?;
+        tx.execute("DELETE FROM notes_tri WHERE path = ?1", params![rel])?;
         tx.execute("DELETE FROM note_meta WHERE path = ?1", params![rel])?;
         tx.execute("DELETE FROM refs WHERE path = ?1", params![rel])?;
         tx.commit()?;
@@ -590,10 +706,13 @@ impl VaultIndex {
         }
     }
 
+    /// Each SQL passed here selects nine columns in order:
+    /// path, title, summary, layer, status, tags, date, score, body.
     fn rows_from_match(
         conn: &Connection,
         sql: &str,
         pattern: &str,
+        query: &str,
         layer: Option<&str>,
         status: Option<&str>,
         limit: i64,
@@ -602,6 +721,7 @@ impl VaultIndex {
         let rows = stmt.query_map(params![pattern, layer, status, limit], |r| {
             let path: String = r.get(0)?;
             let target = format!("[[{}]]", path.strip_suffix(".md").unwrap_or(&path));
+            let body: String = r.get(8)?;
             Ok(SearchHit {
                 path,
                 target,
@@ -612,6 +732,7 @@ impl VaultIndex {
                 tags: r.get(5)?,
                 date: r.get(6)?,
                 score: r.get(7)?,
+                snippet: make_snippet(&body, query, 120),
             })
         })?;
         let mut out = Vec::new();
@@ -645,39 +766,68 @@ impl VaultIndex {
         };
         let limit = limit.clamp(1, 100);
 
-        let sql = "SELECT path, title, summary, layer, status, tags, date, bm25(notes) AS score
+        // P1: weighted bm25 — title/summary/tags outrank a passing body mention.
+        // Column order matches the FTS5 table definition; UNINDEXED columns get 0.
+        let sql = "SELECT path, title, summary, layer, status, tags, date,
+                          bm25(notes, 0.0, 10.0, 6.0, 3.0, 1.0, 0.0, 0.0, 0.0, 0.0) AS score,
+                          body
                    FROM notes
                    WHERE notes MATCH ?1
                      AND (?2 IS NULL OR layer = ?2)
                      AND (?3 IS NULL OR status = ?3)
                    ORDER BY score
                    LIMIT ?4";
-        let mut hits = Self::rows_from_match(&conn, sql, &fts, layer, status, limit)?;
+        let mut hits = Self::rows_from_match(&conn, sql, &fts, query, layer, status, limit)?;
+        let mut seen: HashSet<String> = hits.iter().map(|h| h.path.clone()).collect();
 
-        // unicode61 does not segment CJK reliably: a Chinese query may match
-        // one note through FTS5 while other notes contain the same substring.
-        // Always top up with a substring scan and merge by path so CJK queries
-        // never silently lose hits. This is the local equivalent of the grep
-        // step in agentic retrieval.
+        // P2: trigram tokeniser segments CJK, so a Chinese query that gets no
+        // (or weak) unicode61 ranking is re-run on the parallel trigram index
+        // to obtain a meaningful score ordering. Only for CJK input, and only
+        // when there is room left, so Latin behaviour is byte-for-byte intact.
+        if has_cjk(query) && hits.len() < limit as usize {
+            let tri_sql = "SELECT path, title, summary, layer, status, tags, date,
+                                  bm25(notes_tri, 0.0, 10.0, 6.0, 3.0, 1.0, 0.0, 0.0, 0.0, 0.0) AS score,
+                                  body
+                           FROM notes_tri
+                           WHERE notes_tri MATCH ?1
+                             AND (?2 IS NULL OR layer = ?2)
+                             AND (?3 IS NULL OR status = ?3)
+                           ORDER BY score
+                           LIMIT ?4";
+            let extra =
+                Self::rows_from_match(&conn, tri_sql, &fts, query, layer, status, limit)?;
+            for hit in extra {
+                if hits.len() >= limit as usize {
+                    break;
+                }
+                if seen.insert(hit.path.clone()) {
+                    hits.push(hit);
+                }
+            }
+        }
+
+        // unicode61 (even with trigram help) can still miss substring matches;
+        // top up with an exact instr() scan so CJK queries never lose hits.
+        // `instr()` needs no wildcard escaping, so % _ or \ in the query behave
+        // literally instead of matching the whole vault. Score 0.0 keeps these
+        // below the ranked hits.
         if hits.len() < limit as usize {
-            // `instr()` is an exact substring test: unlike LIKE it needs no
-            // wildcard escaping, so queries containing % _ or \ behave
-            // literally instead of silently matching the whole vault.
-            let sql = "SELECT path, title, summary, layer, status, tags, date, 0.0
+            let sql = "SELECT path, title, summary, layer, status, tags, date, 0.0 AS score, body
                        FROM notes
                        WHERE (instr(title, ?1) > 0 OR instr(summary, ?1) > 0
                            OR instr(tags, ?1) > 0 OR instr(body, ?1) > 0)
                          AND (?2 IS NULL OR layer = ?2)
                          AND (?3 IS NULL OR status = ?3)
                        LIMIT ?4";
-            let extra = Self::rows_from_match(&conn, sql, query, layer, status, limit)?;
-            let mut seen: HashSet<String> = hits.iter().map(|h| h.path.clone()).collect();
+            let extra = Self::rows_from_match(&conn, sql, query, query, layer, status, limit)?;
             for hit in extra {
+                if hits.len() >= limit as usize {
+                    break;
+                }
                 if seen.insert(hit.path.clone()) {
                     hits.push(hit);
                 }
             }
-            hits.truncate(limit as usize);
         }
         Ok(hits)
     }
@@ -939,5 +1089,124 @@ impl VaultIndex {
             "incremental_updates": self.updates.load(Ordering::Relaxed),
             "watcher_events": self.events.load(Ordering::Relaxed),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn note(_rel: &str, title: &str, summary: &str, body: &str) -> String {
+        format!(
+            "---\ntitle: \"{title}\"\nsummary: \"{summary}\"\nlayer: wiki\n---\n\n{body}\n"
+        )
+    }
+
+    struct TestVault {
+        root: PathBuf,
+    }
+    impl Drop for TestVault {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn fixture() -> (TestVault, VaultIndex) {
+        let root = std::env::temp_dir().join(format!(
+            "llm-wiki-test-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let guard = TestVault { root: root.clone() };
+        std::fs::write(
+            root.join("网络策略.md"),
+            note(
+                "网络策略.md",
+                "Kubernetes 网络策略",
+                "How to isolate pods",
+                "Kubernetes 的 NetworkPolicy 用来控制 Pod 之间的流量隔离，是集群安全的核心。",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("存储卷.md"),
+            note(
+                "存储卷.md",
+                "持久化存储",
+                "Persistent volumes",
+                "本文讨论网络附加存储与 PersistentVolume 的绑定，和网络策略无关的内容在末尾提及 network。",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("english.md"),
+            note(
+                "english.md",
+                "Service Mesh",
+                "Traffic management between services",
+                "A service mesh provides traffic management, and mentions the network policy concept briefly.",
+            ),
+        )
+        .unwrap();
+        let idx = VaultIndex::open(root.clone(), &root.join("index.sqlite"), vec![], "AGENTS.md")
+            .unwrap();
+        idx.rebuild().unwrap();
+        (guard, idx)
+    }
+
+    #[test]
+    fn cjk_query_ranks_title_match_first() {
+        let (_dir, idx) = fixture();
+        let hits = idx.search("网络策略", None, None, 10).unwrap();
+        assert!(!hits.is_empty(), "CJK query must not lose all hits");
+        assert_eq!(hits[0].path, "网络策略.md", "title match should rank first");
+    }
+
+    #[test]
+    fn every_hit_has_snippet_with_highlight() {
+        let (_dir, idx) = fixture();
+        for q in ["网络策略", "NetworkPolicy", "traffic management"] {
+            let hits = idx.search(q, None, None, 10).unwrap();
+            assert!(!hits.is_empty(), "query {q} should match something");
+            assert!(
+                hits.iter().any(|h| h.snippet.contains("**")),
+                "query {q} should produce at least one highlighted snippet"
+            );
+            assert!(
+                hits.iter().all(|h| h.snippet.chars().count() <= 200),
+                "snippets must stay bounded"
+            );
+        }
+    }
+
+    #[test]
+    fn latin_query_still_works() {
+        let (_dir, idx) = fixture();
+        let hits = idx.search("service mesh", None, None, 10).unwrap();
+        assert_eq!(hits.first().map(|h| h.path.as_str()), Some("english.md"));
+    }
+
+    #[test]
+    fn substring_fallback_keeps_cjk_hits() {
+        let (_dir, idx) = fixture();
+        let hits = idx.search("流量隔离", None, None, 10).unwrap();
+        assert!(
+            hits.iter().any(|h| h.path == "网络策略.md"),
+            "substring-only CJK term must still surface the note"
+        );
+    }
+
+    #[test]
+    fn weighted_bm25_prefers_summary_over_body() {
+        let (_dir, idx) = fixture();
+        // "Persistent volumes" is in 存储卷 summary; "network" appears only in
+        // its body. The exact phrase in summary should outrank a body mention.
+        let hits = idx.search("Persistent volumes", None, None, 10).unwrap();
+        assert_eq!(hits.first().map(|h| h.path.as_str()), Some("存储卷.md"));
     }
 }

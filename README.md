@@ -120,7 +120,7 @@ new page has no link name yet.
 
 | Tool | Arguments | Purpose |
 | --- | --- | --- |
-| `vault_search` | `query, layer?, status?, limit?` | FTS5 + exact substring fallback; returns ready-to-feed `target` |
+| `vault_search` | `query, layer?, status?, limit?` | Weighted FTS5 + CJK trigram + substring fallback; returns ready-to-feed `target` and a short `snippet` with `**highlighted**` matches |
 | `vault_read` | `target` | Standard fields, `frontmatter_all`, body, `version`, and resolved `links` |
 | `vault_resolve` | `targets[]` | Batch preview: metadata only, no body. Ambiguity gives `candidates[]` |
 | `vault_status` | — | Index counts, `link_refs`, `wiki_root`, mode, watcher counters |

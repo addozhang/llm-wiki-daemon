@@ -1,8 +1,7 @@
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
-use std::hash::{Hash, Hasher};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -139,10 +138,19 @@ fn parse_note(text: &str) -> (Frontmatter, String) {
     (fm, lines[end + 1..].join("\n"))
 }
 
+/// Stable content hash used as the CAS `version` and for index dedup.
+/// FNV-1a 64-bit over UTF-8 bytes: unlike `DefaultHasher`, its output is
+/// specified and will not change across Rust compiler versions, so an
+/// upgrade cannot invalidate every in-flight `expected_version`.
 pub fn content_hash(s: &str) -> String {
-    let mut h = DefaultHasher::new();
-    s.hash(&mut h);
-    format!("{:016x}", h.finish())
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut h = OFFSET;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    format!("{:016x}", h)
 }
 
 /// Detect CJK code points in a query. Trigram tokenisation only helps for
@@ -187,26 +195,68 @@ fn make_snippet(body: &str, query: &str, max_chars: usize) -> String {
         }
     }
     let chars: Vec<char> = flat.chars().collect();
-    let (start, end, hit) = match best {
+    let (start, end) = match best {
         Some((byte_pos, term_len)) => {
             let center = flat[..byte_pos].chars().count();
             let half = max_chars / 2;
             let s = center.saturating_sub(half);
             let e = (center + term_len.max(max_chars / 2)).min(chars.len());
-            (s, e, Some((center, center + flat[byte_pos..byte_pos + term_len].chars().count())))
+            (s, e)
         }
-        None => (0, chars.len().min(max_chars), None),
+        None => (0, chars.len().min(max_chars)),
     };
+
+    // Collect every query-term occurrence inside the window, in char offsets,
+    // and highlight all of them. A multi-word query should show the agent
+    // where EACH term landed, not just the earliest one.
+    let mut marks: Vec<(usize, usize)> = Vec::new(); // (char start, char end)
+    for term in &terms {
+        let needle = term.to_lowercase();
+        if needle.is_empty() {
+            continue;
+        }
+        let mut search_from = 0usize;
+        while let Some(rel) = lower[search_from..].find(&needle) {
+            let byte_pos = search_from + rel;
+            let cs = flat[..byte_pos].chars().count();
+            let ce = cs + needle.chars().count();
+            if cs >= end {
+                break;
+            }
+            if ce > start {
+                marks.push((cs.max(start), ce.min(end)));
+            }
+            search_from = byte_pos + needle.len();
+        }
+    }
+    marks.sort_unstable();
+    marks.dedup();
+    // Merge overlapping ranges (e.g. "network" and "network policy").
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (cs, ce) in marks {
+        if let Some(last) = merged.last_mut() {
+            if cs <= last.1 {
+                last.1 = last.1.max(ce);
+                continue;
+            }
+        }
+        merged.push((cs, ce));
+    }
+
     let mut out = String::new();
     if start > 0 {
         out.push('…');
     }
-    for (i, c) in chars[start..end].iter().enumerate() {
-        if hit.is_some_and(|(hs, _)| start + i == hs) {
+    let mut mi = 0usize;
+    for i in start..end {
+        while mi < merged.len() && merged[mi].1 <= i {
+            mi += 1;
+        }
+        if merged.get(mi).is_some_and(|(s, _)| *s == i) {
             out.push_str("**");
         }
-        out.push(*c);
-        if hit.is_some_and(|(_, he)| start + i + 1 == he) {
+        out.push(chars[i]);
+        if merged.get(mi).is_some_and(|(_, e)| *e == i + 1) {
             out.push_str("**");
         }
     }
@@ -811,6 +861,10 @@ impl VaultIndex {
             format!("\"{}\"", query.replace('"', "\"\""))
         };
         let limit = limit.clamp(1, 100);
+        // Each path must contribute a deeper pool than the final result count:
+        // RRF can only fuse docs it actually sees, so a note ranked #12 in one
+        // index and #2 in another must be in both lists to be promoted.
+        let pool = (limit * 5).clamp(limit, 100);
 
         // P1: weighted bm25 — title/summary/tags outrank a passing body mention.
         // Column order matches the FTS5 table definition; UNINDEXED columns get 0.
@@ -825,7 +879,7 @@ impl VaultIndex {
                    LIMIT ?4";
         // Each retrieval path produces its own ranked list. RRF then fuses
         // them by rank, so cross-index score comparability is irrelevant.
-        let primary = Self::rows_from_match(&conn, sql, &fts, query, layer, status, limit)?;
+        let primary = Self::rows_from_match(&conn, sql, &fts, query, layer, status, pool)?;
         let mut lists: Vec<(Vec<SearchHit>, f64)> = vec![(primary, 1.0)];
 
         // P2: trigram tokeniser segments CJK, so a Chinese query that gets no
@@ -840,7 +894,7 @@ impl VaultIndex {
                              AND (?3 IS NULL OR status = ?3)
                            ORDER BY score
                            LIMIT ?4";
-            let tri = Self::rows_from_match(&conn, tri_sql, &fts, query, layer, status, limit)?;
+            let tri = Self::rows_from_match(&conn, tri_sql, &fts, query, layer, status, pool)?;
             lists.push((tri, 1.0));
         }
 
@@ -856,7 +910,7 @@ impl VaultIndex {
                               AND (?3 IS NULL OR status = ?3)
                             LIMIT ?4";
         let fallback =
-            Self::rows_from_match(&conn, fallback_sql, query, query, layer, status, limit)?;
+            Self::rows_from_match(&conn, fallback_sql, query, query, layer, status, pool)?;
         lists.push((fallback, 0.1));
 
         Ok(rrf_fuse(&lists, limit as usize))
@@ -1304,5 +1358,41 @@ mod tests {
                 "hits must be sorted by descending RRF score"
             );
         }
+    }
+
+    #[test]
+    fn content_hash_is_stable_across_runs() {
+        // Pin a known value so a future accidental hash-algorithm change is
+        // caught immediately (FNV-1a 64-bit over UTF-8 bytes).
+        assert_eq!(content_hash("hello"), "a430d84680aabd0b");
+        assert_eq!(content_hash(""), "cbf29ce484222325");
+        assert_ne!(content_hash("a"), content_hash("b"));
+    }
+
+    #[test]
+    fn snippet_highlights_every_query_term() {
+        let body = "First we deploy a cluster, then we observe the traffic with probes.";
+        let snip = make_snippet(body, "deploy observe", 120);
+        assert_eq!(
+            snip.matches("**").count(),
+            4,
+            "both terms should be wrapped: expected 4 markers, got {snip}"
+        );
+        assert!(snip.contains("**deploy**"), "{snip}");
+        assert!(snip.contains("**observe**"), "{snip}");
+    }
+
+    #[test]
+    fn deep_pool_lets_later_rank_survive_small_limit() {
+        let (_dir, idx) = fixture();
+        // Even asking for a single result, fusion draws from a deeper pool
+        // (limit * 5) on each path. A CJK query where the top primary hit and
+        // the top trigram hit differ must still return the best-fused page.
+        let hits = idx.search("OpenTelemetry 插桩", None, None, 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].path, "双概念.md",
+            "deep pool must surface the doubly-matched page even with limit=1"
+        );
     }
 }

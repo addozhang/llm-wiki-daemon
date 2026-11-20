@@ -335,7 +335,9 @@ impl WriteStore {
             && matches!(req.key.as_deref(), Some("sources") | Some("related"))
         {
             // Provenance must stay verifiable when it grows, not only at create.
-            let normalized = normalize_source(&req.value, &self.index, false)?;
+            // `sources` must point to raw/note; `related` may also point to wiki.
+            let allow_wiki = req.key.as_deref() == Some("related");
+            let normalized = normalize_source(&req.value, &self.index, allow_wiki)?;
             req.value = format!("[[{normalized}]]");
         }
 
@@ -723,8 +725,24 @@ impl WriteStore {
                 }
             }
         }
+
+        // Graph check: wiki pages with zero incoming links from any other note
+        // (body wikilinks or frontmatter sources/related/supersedes).
+        let orphans = self.index.orphan_wiki_pages()?;
+        let orphan_wiki_count = orphans.len();
+        for rel in orphans {
+            total += 1;
+            if issues.len() < limit {
+                issues.push(json!({
+                    "path": rel,
+                    "issue": "孤儿 wiki 页（无其他笔记入链）",
+                }));
+            }
+        }
+
         Ok(json!({
             "scanned": scanned,
+            "orphan_wiki_count": orphan_wiki_count,
             "issue_count": total,
             "returned": issues.len(),
             "truncated": total > issues.len(),
@@ -782,6 +800,14 @@ fn validate_frontmatter(text: &str) -> Result<()> {
     Ok(())
 }
 
+fn is_yaml_continuation(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    line.starts_with(' ')
+        || line.starts_with('\t')
+        || trimmed.starts_with("- ")
+        || trimmed == "-"
+}
+
 fn set_frontmatter(text: &str, field: &str, value: &str) -> Result<String> {
     if field.is_empty()
         || !field
@@ -801,17 +827,21 @@ fn set_frontmatter(text: &str, field: &str, value: &str) -> Result<String> {
     let scalar = yaml_scalar(value);
     let mut out: Vec<String> = Vec::with_capacity(lines.len() + 1);
     let mut found = false;
+    let mut skipping = false;
     for (i, line) in lines.iter().enumerate() {
-        let top_level = i > 0
-            && i < end
-            && !line.starts_with(' ')
-            && !line.starts_with('\t')
-            && !line.trim_start().starts_with('-');
+        if skipping {
+            if i < end && is_yaml_continuation(line) {
+                continue;
+            }
+            skipping = false;
+        }
+        let top_level = i > 0 && i < end && !is_yaml_continuation(line);
         if top_level {
             if let Some((key, _)) = line.split_once(':') {
                 if key.trim() == field {
                     out.push(format!("{field}: {scalar}"));
                     found = true;
+                    skipping = true;
                     continue;
                 }
             }
@@ -1085,7 +1115,9 @@ fn normalize_source(raw: &str, index: &VaultIndex, allow_wiki: bool) -> Result<S
     Ok(rel)
 }
 
-/// Append one item to a flow-style YAML list such as sources: ["[[a]]"].
+/// Append one item to a frontmatter list (either flow-style `sources: ["[[a]]"]`
+/// or a human-written YAML block list `sources:\n  - "[[a]]"`). Normalizes the
+/// result to a single-line JSON array so subsequent edits stay deterministic.
 fn append_frontmatter_list(text: &str, field: &str, value: &str) -> Result<String> {
     let lines: Vec<&str> = text.split('\n').collect();
     let end = lines
@@ -1095,15 +1127,33 @@ fn append_frontmatter_list(text: &str, field: &str, value: &str) -> Result<Strin
         .find(|(_, l)| l.trim_end() == "---")
         .map(|(i, _)| i)
         .context("frontmatter 未闭合")?;
-    let prefix = format!("{field}:");
     let pos = lines[1..end]
         .iter()
-        .position(|l| l.starts_with(&prefix))
+        .position(|l| {
+            !is_yaml_continuation(l)
+                && l.split_once(':').is_some_and(|(k, _)| k.trim() == field)
+        })
         .with_context(|| format!("找不到 {field} 字段"))?
         + 1;
     let raw = lines[pos].split_once(':').unwrap().1.trim();
-    let mut items: Vec<String> = serde_json::from_str(raw)
-        .with_context(|| format!("{field} 不是可追加的流式数组"))?;
+    let mut block_end = pos + 1;
+    let mut items: Vec<String> = if raw.is_empty() {
+        let mut list = Vec::new();
+        while block_end < end && is_yaml_continuation(lines[block_end]) {
+            let t = lines[block_end].trim();
+            if let Some(rest) = t.strip_prefix("- ") {
+                let cleaned = rest.trim().trim_matches('"').trim_matches('\'').trim();
+                if !cleaned.is_empty() {
+                    list.push(cleaned.to_string());
+                }
+            }
+            block_end += 1;
+        }
+        list
+    } else {
+        serde_json::from_str(raw)
+            .with_context(|| format!("{field} 不是可追加的流式数组或 YAML 块列表"))?
+    };
     let item = if value.starts_with("[[") {
         value.trim().to_string()
     } else {
@@ -1113,7 +1163,180 @@ fn append_frontmatter_list(text: &str, field: &str, value: &str) -> Result<Strin
         return Ok(text.to_string());
     }
     items.push(item);
-    let mut out: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
-    out[pos] = format!("{field}: {}", serde_json::to_string(&items)?);
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    out.extend(lines[..pos].iter().map(|s| (*s).to_string()));
+    out.push(format!("{field}: {}", serde_json::to_string(&items)?));
+    out.extend(lines[block_end..].iter().map(|s| (*s).to_string()));
     Ok(out.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static STORE_TEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn make_store() -> (TempDir, Arc<VaultIndex>, WriteStore) {
+        let root = std::env::temp_dir().join(format!(
+            "llm-wiki-store-test-{}-{}",
+            std::process::id(),
+            STORE_TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let vault = root.join("vault");
+        std::fs::create_dir_all(vault.join("raw")).unwrap();
+        std::fs::create_dir_all(vault.join("wiki")).unwrap();
+        std::fs::write(vault.join("AGENTS.md"), "# schema\n").unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let vault = root.join("vault");
+        let logs = root.join("logs");
+
+        let idx = Arc::new(
+            VaultIndex::open(vault.clone(), &root.join("index.sqlite"), vec![], "AGENTS.md")
+                .unwrap(),
+        );
+        let audit = Arc::new(AuditLog::new(&logs, 1024 * 1024).unwrap());
+        let store = WriteStore::new(Arc::clone(&idx), true, "wiki".to_string(), audit);
+        (TempDir(root), idx, store)
+    }
+
+    #[test]
+    fn set_frontmatter_replaces_yaml_block_list_cleanly() {
+        let doc = "---\ntitle: \"Demo\"\nlayer: wiki\nsources:\n  - \"[[raw/a]]\"\n  - \"[[raw/b]]\"\nsummary: \"old\"\n---\n\nbody\n";
+        let updated = set_frontmatter(doc, "sources", "[\"[[raw/c]]\"]").unwrap();
+        validate_frontmatter(&updated).unwrap();
+        assert!(updated.contains("sources: [\"[[raw/c]]\"]"), "{updated}");
+        assert!(!updated.contains("raw/a"), "old block item leaked: {updated}");
+        assert!(!updated.contains("raw/b"), "old block item leaked: {updated}");
+        assert!(updated.contains("summary: \"old\""), "{updated}");
+    }
+
+    #[test]
+    fn append_frontmatter_list_handles_yaml_block_list_and_dedups() {
+        let doc = "---\ntitle: \"Demo\"\nlayer: wiki\nsources:\n  - \"[[raw/a]]\"\n  - [[raw/b]]\nsummary: \"ok\"\n---\n\nbody\n";
+        let updated = append_frontmatter_list(doc, "sources", "[[raw/c]]").unwrap();
+        validate_frontmatter(&updated).unwrap();
+        assert!(
+            updated.contains("sources: [\"[[raw/a]]\",\"[[raw/b]]\",\"[[raw/c]]\"]"),
+            "{updated}"
+        );
+        assert!(!updated.contains("\n  - "), "block lines should be replaced: {updated}");
+
+        // Appending an existing item is a no-op.
+        let dup = append_frontmatter_list(doc, "sources", "[[raw/a]]").unwrap();
+        assert_eq!(dup, doc);
+
+        // Empty block list (`related:`) also works.
+        let empty = "---\ntitle: \"Demo\"\nlayer: wiki\nrelated:\nsummary: \"ok\"\n---\n\nbody\n";
+        let appended = append_frontmatter_list(empty, "related", "wiki/other").unwrap();
+        validate_frontmatter(&appended).unwrap();
+        assert!(appended.contains("related: [\"[[wiki/other]]\"]"), "{appended}");
+    }
+
+    #[tokio::test]
+    async fn patch_related_append_allows_wiki_target_while_sources_rejects_wiki() {
+        let (tmp, idx, store) = make_store();
+        let vault = tmp.0.join("vault");
+        std::fs::write(
+            vault.join("raw/src.md"),
+            "---\ntitle: \"Src\"\nlayer: raw\n---\n\nraw\n",
+        )
+        .unwrap();
+        std::fs::write(
+            vault.join("wiki/a.md"),
+            "---\ntitle: \"A\"\nlayer: wiki\nsources: [\"[[raw/src]]\"]\nrelated: []\nsummary: \"A\"\n---\n\nbody A\n",
+        )
+        .unwrap();
+        std::fs::write(
+            vault.join("wiki/b.md"),
+            "---\ntitle: \"B\"\nlayer: wiki\nsources: [\"[[raw/src]]\"]\nsummary: \"B\"\n---\n\nbody B\n",
+        )
+        .unwrap();
+        idx.rebuild().unwrap();
+
+        let ver = idx.read("[[wiki/a]]").unwrap()["version"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Appending another wiki page to `related` must succeed.
+        let res = store
+            .patch(
+                PatchRequest {
+                    target: "[[wiki/a]]".to_string(),
+                    part: "frontmatter".to_string(),
+                    key: Some("related".to_string()),
+                    op: "append".to_string(),
+                    value: "[[wiki/b]]".to_string(),
+                    expected_version: ver,
+                    reason: Some("link related wiki".to_string()),
+                },
+                "patch",
+            )
+            .await
+            .unwrap();
+        assert_eq!(res["ok"], true, "{res}");
+
+        let ver2 = res["version_after"].as_str().unwrap().to_string();
+        // Appending a wiki page to `sources` must still be rejected.
+        let err = store
+            .patch(
+                PatchRequest {
+                    target: "[[wiki/a]]".to_string(),
+                    part: "frontmatter".to_string(),
+                    key: Some("sources".to_string()),
+                    op: "append".to_string(),
+                    value: "[[wiki/b]]".to_string(),
+                    expected_version: ver2,
+                    reason: None,
+                },
+                "patch",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("raw/note"),
+            "expected raw/note error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn lint_reports_orphan_wiki_pages() {
+        let (tmp, idx, store) = make_store();
+        let vault = tmp.0.join("vault");
+        std::fs::write(
+            vault.join("raw/src.md"),
+            "---\ntitle: \"Src\"\nlayer: raw\n---\n\nraw\n",
+        )
+        .unwrap();
+        std::fs::write(
+            vault.join("wiki/linked.md"),
+            "---\ntitle: \"Linked\"\nlayer: wiki\nsources: [\"[[raw/src]]\"]\n---\n\nlinked\n",
+        )
+        .unwrap();
+        std::fs::write(
+            vault.join("wiki/hub.md"),
+            "---\ntitle: \"Hub\"\nlayer: wiki\nsources: [\"[[raw/src]]\"]\n---\n\nsee [[linked]]\n",
+        )
+        .unwrap();
+        idx.rebuild().unwrap();
+
+        let report = store.lint(50).unwrap();
+        assert_eq!(report["orphan_wiki_count"], 1, "{report}");
+        let issues = report["issues"].as_array().unwrap();
+        assert!(
+            issues
+                .iter()
+                .any(|i| i["path"] == "wiki/hub.md" && i["issue"].as_str().unwrap().contains("孤儿")),
+            "{issues:?}"
+        );
+    }
 }

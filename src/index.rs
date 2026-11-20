@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value as SqlValue};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -440,6 +440,96 @@ fn parse_target(target: &str) -> TargetParts {
     }
 }
 
+/// Extract normalized outgoing link targets `(to_ref, kind)` from both the
+/// note body and frontmatter provenance fields (`sources`, `related`,
+/// `supersedes`). Used to build the `edges` table for backlinks and orphan
+/// wiki detection without needing two-pass resolution during indexing.
+fn extract_edges(text: &str, body: &str) -> Vec<(String, &'static str)> {
+    let mut out: Vec<(String, &'static str)> = Vec::new();
+    let mut seen: HashSet<(String, &'static str)> = HashSet::new();
+    let mut push = |raw: &str, kind: &'static str| {
+        let parts = parse_target(raw);
+        if parts.key.is_empty() || parts.media {
+            return;
+        }
+        if seen.insert((parts.key.clone(), kind)) {
+            out.push((parts.key, kind));
+        }
+    };
+
+    for link in extract_wikilinks(body) {
+        push(&link, "body");
+    }
+
+    let lines: Vec<&str> = text.split('\n').collect();
+    if lines.first().map(|l| l.trim_end()) == Some("---") {
+        if let Some(end) = lines
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, l)| l.trim_end() == "---")
+            .map(|(i, _)| i)
+        {
+            let mut i = 1usize;
+            while i < end {
+                let line = lines[i];
+                let trimmed = line.trim();
+                i += 1;
+                if trimmed.is_empty()
+                    || line.starts_with(' ')
+                    || line.starts_with('\t')
+                    || trimmed.starts_with('-')
+                {
+                    continue;
+                }
+                let Some((key, value)) = line.split_once(':') else {
+                    continue;
+                };
+                let kind = match key.trim() {
+                    "sources" => "source",
+                    "related" => "related",
+                    "supersedes" => "supersedes",
+                    _ => continue,
+                };
+                let raw = value.trim();
+                if !raw.is_empty() {
+                    if let Ok(arr) = serde_json::from_str::<Vec<String>>(raw) {
+                        for item in arr {
+                            push(&item, kind);
+                        }
+                    } else {
+                        let inner = raw.trim_start_matches('[').trim_end_matches(']');
+                        for part in inner.split(',') {
+                            let item = part.trim().trim_matches('"').trim_matches('\'').trim();
+                            if !item.is_empty() {
+                                push(item, kind);
+                            }
+                        }
+                    }
+                } else {
+                    let mut j = i;
+                    while j < end {
+                        let t = lines[j].trim();
+                        if let Some(item) = t.strip_prefix("- ") {
+                            let cleaned = item.trim().trim_matches('"').trim_matches('\'').trim();
+                            if !cleaned.is_empty() {
+                                push(cleaned, kind);
+                            }
+                            j += 1;
+                        } else if t.is_empty() {
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct LinkResolution {
     /// Internal filesystem location. Never exposed as an addressing hint.
@@ -523,6 +613,7 @@ impl VaultIndex {
              DROP TABLE IF EXISTS notes_tri;
              DROP TABLE IF EXISTS note_meta;
              DROP TABLE IF EXISTS refs;
+             DROP TABLE IF EXISTS edges;
              CREATE VIRTUAL TABLE notes USING fts5(
                  path UNINDEXED,
                  title, summary, tags, body,
@@ -548,7 +639,14 @@ impl VaultIndex {
                  kind TEXT NOT NULL,
                  PRIMARY KEY (ref, path)
              );
-             CREATE INDEX refs_ref ON refs(ref);",
+             CREATE INDEX refs_ref ON refs(ref);
+             CREATE TABLE edges (
+                 from_path TEXT NOT NULL,
+                 to_ref TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 PRIMARY KEY (from_path, to_ref, kind)
+             );
+             CREATE INDEX edges_to_ref ON edges(to_ref);",
         )?;
         let tx = conn.transaction()?;
         let root = self.root.clone();
@@ -588,6 +686,9 @@ impl VaultIndex {
             )?;
             let mut ins_refs = tx.prepare(
                 "INSERT OR IGNORE INTO refs (ref, path, kind) VALUES (?1, ?2, ?3)",
+            )?;
+            let mut ins_edges = tx.prepare(
+                "INSERT OR IGNORE INTO edges (from_path, to_ref, kind) VALUES (?1, ?2, ?3)",
             )?;
             for entry in walker {
                 let entry = entry?;
@@ -641,6 +742,9 @@ impl VaultIndex {
                 ])?;
                 for (key, kind) in ref_keys(&rel, &fm) {
                     ins_refs.execute(params![key, rel, kind])?;
+                }
+                for (to_ref, kind) in extract_edges(&text, &body) {
+                    ins_edges.execute(params![rel, to_ref, kind])?;
                 }
                 count += 1;
             }
@@ -699,6 +803,7 @@ impl VaultIndex {
                 tx.execute("DELETE FROM notes_tri WHERE path = ?1", params![rel])?;
                 tx.execute("DELETE FROM note_meta WHERE path = ?1", params![rel])?;
                 tx.execute("DELETE FROM refs WHERE path = ?1", params![rel])?;
+                tx.execute("DELETE FROM edges WHERE from_path = ?1", params![rel])?;
                 tx.commit()?;
                 drop(conn);
                 if n > 0 {
@@ -728,6 +833,7 @@ impl VaultIndex {
         tx.execute("DELETE FROM notes_tri WHERE path = ?1", params![rel])?;
         tx.execute("DELETE FROM note_meta WHERE path = ?1", params![rel])?;
         tx.execute("DELETE FROM refs WHERE path = ?1", params![rel])?;
+        tx.execute("DELETE FROM edges WHERE from_path = ?1", params![rel])?;
         tx.execute(
             "INSERT INTO notes (path, title, summary, tags, body, layer, status, date, hash)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -777,6 +883,12 @@ impl VaultIndex {
                 params![key, rel, kind],
             )?;
         }
+        for (to_ref, kind) in extract_edges(&text, &body) {
+            tx.execute(
+                "INSERT OR IGNORE INTO edges (from_path, to_ref, kind) VALUES (?1, ?2, ?3)",
+                params![rel, to_ref, kind],
+            )?;
+        }
         tx.commit()?;
         drop(conn);
         self.updates.fetch_add(1, Ordering::Relaxed);
@@ -790,6 +902,7 @@ impl VaultIndex {
         tx.execute("DELETE FROM notes_tri WHERE path = ?1", params![rel])?;
         tx.execute("DELETE FROM note_meta WHERE path = ?1", params![rel])?;
         tx.execute("DELETE FROM refs WHERE path = ?1", params![rel])?;
+        tx.execute("DELETE FROM edges WHERE from_path = ?1", params![rel])?;
         tx.commit()?;
         drop(conn);
         if n > 0 {
@@ -898,22 +1011,107 @@ impl VaultIndex {
             lists.push((tri, 1.0));
         }
 
-        // unicode61 (even with trigram help) can miss substring matches; an
-        // exact instr() scan tops up recall. Down-weighted in RRF (0.1) so a
-        // substring hit never outranks a real index hit. `instr()` needs no
-        // wildcard escaping, so % _ or \ behave literally.
-        let fallback_sql = "SELECT path, title, summary, layer, status, tags, date, 0.0 AS score, body
-                            FROM notes
-                            WHERE (instr(title, ?1) > 0 OR instr(summary, ?1) > 0
-                                OR instr(tags, ?1) > 0 OR instr(body, ?1) > 0)
-                              AND (?2 IS NULL OR layer = ?2)
-                              AND (?3 IS NULL OR status = ?3)
-                            LIMIT ?4";
-        let fallback =
-            Self::rows_from_match(&conn, fallback_sql, query, query, layer, status, pool)?;
+        // P3: field-weighted, multi-term substring scan.
+        // SQLite's trigram tokenizer ignores terms shorter than 3 chars, so
+        // 2-character CJK concepts (e.g. "缓存", "架构") and multi-word CJK
+        // queries rely on this path. Scoring per term by field weight
+        // (title 10, summary 6, tags 3, body 1) ensures title matches and
+        // multi-term hits rank first instead of arbitrary table order.
+        // Down-weighted in RRF (0.1) so it tops up recall without outranking
+        // real FTS5 hits when those exist.
+        let fallback = Self::substring_fallback(&conn, &words, query, layer, status, pool)?;
         lists.push((fallback, 0.1));
 
         Ok(rrf_fuse(&lists, limit as usize))
+    }
+
+    fn substring_fallback(
+        conn: &Connection,
+        words: &[&str],
+        query: &str,
+        layer: Option<&str>,
+        status: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SearchHit>> {
+        let mut terms: Vec<String> = Vec::new();
+        for w in words.iter().take(16) {
+            let lower = w.to_lowercase();
+            if !lower.is_empty() && !terms.contains(&lower) {
+                terms.push(lower);
+            }
+        }
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Bindings: ?1 = layer, ?2 = status, ?3 = limit, ?4.. = lowercased terms.
+        let mut score_parts: Vec<String> = Vec::with_capacity(terms.len());
+        let mut match_parts: Vec<String> = Vec::with_capacity(terms.len());
+        for i in 0..terms.len() {
+            let p = i + 4;
+            score_parts.push(format!(
+                "(CASE WHEN instr(lower(title), ?{p}) > 0 THEN 10.0 ELSE 0.0 END \
+                 + CASE WHEN instr(lower(summary), ?{p}) > 0 THEN 6.0 ELSE 0.0 END \
+                 + CASE WHEN instr(lower(tags), ?{p}) > 0 THEN 3.0 ELSE 0.0 END \
+                 + CASE WHEN instr(lower(body), ?{p}) > 0 THEN 1.0 ELSE 0.0 END)"
+            ));
+            match_parts.push(format!(
+                "(instr(lower(title), ?{p}) > 0 OR instr(lower(summary), ?{p}) > 0 \
+                 OR instr(lower(tags), ?{p}) > 0 OR instr(lower(body), ?{p}) > 0)"
+            ));
+        }
+
+        let sql = format!(
+            "SELECT path, title, summary, layer, status, tags, date,
+                    ({score_expr}) AS fscore, body
+             FROM notes
+             WHERE ({where_expr})
+               AND (?1 IS NULL OR layer = ?1)
+               AND (?2 IS NULL OR status = ?2)
+             ORDER BY fscore DESC, path ASC
+             LIMIT ?3",
+            score_expr = score_parts.join(" + "),
+            where_expr = match_parts.join(" OR "),
+        );
+
+        let mut bind: Vec<SqlValue> = Vec::with_capacity(3 + terms.len());
+        bind.push(match layer {
+            Some(s) => SqlValue::Text(s.to_string()),
+            None => SqlValue::Null,
+        });
+        bind.push(match status {
+            Some(s) => SqlValue::Text(s.to_string()),
+            None => SqlValue::Null,
+        });
+        bind.push(SqlValue::Integer(limit));
+        for t in terms {
+            bind.push(SqlValue::Text(t));
+        }
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(bind), |r| {
+            let path: String = r.get(0)?;
+            let target = format!("[[{}]]", path.strip_suffix(".md").unwrap_or(&path));
+            let body: String = r.get(8)?;
+            Ok(SearchHit {
+                path,
+                target,
+                title: r.get(1)?,
+                summary: r.get(2)?,
+                layer: r.get(3)?,
+                status: r.get(4)?,
+                tags: r.get(5)?,
+                date: r.get(6)?,
+                score: 0.0, // filled by rrf_fuse
+                bm25: 0.0,  // fallback is not an FTS5 bm25 hit
+                snippet: make_snippet(&body, query, 120),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// Read one note addressed by an Obsidian wikilink (or a bare name / path).
@@ -1015,6 +1213,7 @@ impl VaultIndex {
         // no path conversion happens on the client side.
         let targets: Vec<String> = extract_wikilinks(&body);
         let links = self.preview(&targets)?;
+        let backlinks = self.backlinks(&rel)?;
         Ok(serde_json::json!({
             "path": rel,
             "target": target,
@@ -1030,6 +1229,7 @@ impl VaultIndex {
             "frontmatter_all": all,
             "body": body,
             "links": links,
+            "backlinks": backlinks,
         }))
     }
 
@@ -1160,13 +1360,71 @@ impl VaultIndex {
         Ok(out)
     }
 
+    /// Notes that reference `rel` via body wikilinks or frontmatter provenance
+    /// (`sources`, `related`, `supersedes`), resolved dynamically through `refs`.
+    pub fn backlinks(&self, rel: &str) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT e.from_path, m.title, m.summary, m.layer, m.status, m.kind, m.hash
+               FROM refs r
+               JOIN edges e ON e.to_ref = r.ref
+               JOIN note_meta m ON m.path = e.from_path
+              WHERE r.path = ?1 AND e.from_path != ?1
+              ORDER BY e.from_path
+              LIMIT 200",
+        )?;
+        let rows = stmt.query_map(params![rel], |r| {
+            let path: String = r.get(0)?;
+            let no_ext = path.strip_suffix(".md").unwrap_or(&path);
+            Ok(serde_json::json!({
+                "target": format!("[[{no_ext}]]"),
+                "title": r.get::<_, String>(1)?,
+                "summary": r.get::<_, String>(2)?,
+                "layer": r.get::<_, String>(3)?,
+                "status": r.get::<_, String>(4)?,
+                "kind": r.get::<_, String>(5)?,
+                "version": r.get::<_, String>(6)?,
+            }))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Wiki pages (`layer = 'wiki'`) with no incoming link from any other note.
+    pub fn orphan_wiki_pages(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT m.path
+               FROM note_meta m
+              WHERE m.layer = 'wiki'
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM refs r
+                      JOIN edges e ON e.to_ref = r.ref
+                     WHERE r.path = m.path AND e.from_path != m.path
+                )
+              ORDER BY m.path",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn status(&self) -> Result<serde_json::Value> {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row("SELECT count(*) FROM notes", [], |r| r.get(0))?;
         let refs: i64 = conn.query_row("SELECT count(*) FROM refs", [], |r| r.get(0))?;
+        let edges: i64 = conn.query_row("SELECT count(*) FROM edges", [], |r| r.get(0))?;
         Ok(serde_json::json!({
             "indexed_notes": count,
             "link_refs": refs,
+            "link_edges": edges,
             "vault_root": self.root.to_string_lossy(),
             "schema_present": self.schema_present,
             "index_db": self.db_path.to_string_lossy(),
@@ -1394,5 +1652,140 @@ mod tests {
             hits[0].path, "双概念.md",
             "deep pool must surface the doubly-matched page even with limit=1"
         );
+    }
+
+    #[test]
+    fn two_char_cjk_fallback_ranks_title_over_body() {
+        let (dir, idx) = fixture();
+        std::fs::write(
+            dir.root.join("正文提缓存.md"),
+            note(
+                "正文提缓存.md",
+                "性能调优指南",
+                "General performance tips",
+                "在高并发场景下合理使用缓存可以降低数据库压力。",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.root.join("标题有缓存.md"),
+            note(
+                "标题有缓存.md",
+                "分布式缓存架构",
+                "Distributed cache design",
+                "介绍常见的淘汰策略和一致性方案。",
+            ),
+        )
+        .unwrap();
+        idx.rebuild().unwrap();
+
+        // "缓存" is 2 chars (below FTS5 trigram minimum of 3), so it relies on
+        // the weighted substring fallback. Title match must rank first.
+        let hits = idx.search("缓存", None, None, 10).unwrap();
+        assert!(hits.len() >= 2, "expected at least 2 hits, got {hits:?}");
+        assert_eq!(
+            hits[0].path, "标题有缓存.md",
+            "2-char CJK title match must outrank body-only match"
+        );
+    }
+
+    #[test]
+    fn multi_term_cjk_fallback_matches_separated_terms() {
+        let (dir, idx) = fixture();
+        std::fs::write(
+            dir.root.join("双词命中.md"),
+            note(
+                "双词命中.md",
+                "分布式缓存设计",
+                "Cache isolation",
+                "多租户场景下需要对不同业务的流量进行严格隔离。",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.root.join("单词命中.md"),
+            note(
+                "单词命中.md",
+                "普通笔记",
+                "Only mentions cache",
+                "这里只提到了一次缓存。",
+            ),
+        )
+        .unwrap();
+        idx.rebuild().unwrap();
+
+        // Neither "缓存" nor "隔离" is >= 3 chars, and they are not contiguous
+        // in the document. Multi-term fallback must find and rank 双词命中 first.
+        let hits = idx.search("缓存 隔离", None, None, 10).unwrap();
+        assert_eq!(
+            hits.first().map(|h| h.path.as_str()),
+            Some("双词命中.md"),
+            "doc matching both separated 2-char CJK terms must rank first"
+        );
+    }
+
+    #[test]
+    fn backlinks_and_orphan_wiki_pages_track_body_and_frontmatter_edges() {
+        let root = std::env::temp_dir().join(format!(
+            "llm-wiki-edges-{}-{}",
+            std::process::id(),
+            TEST_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("raw")).unwrap();
+        std::fs::create_dir_all(root.join("wiki")).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let _guard = TestVault { root: root.clone() };
+
+        std::fs::write(
+            root.join("raw/source.md"),
+            "---\ntitle: \"Raw Source\"\nlayer: raw\n---\n\n原始资料内容。\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("wiki/target.md"),
+            "---\ntitle: \"Target Page\"\nlayer: wiki\nsources: [\"[[raw/source]]\"]\n---\n\n被引用页。\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("wiki/referrer.md"),
+            "---\ntitle: \"Referrer Page\"\nlayer: wiki\nsources:\n  - \"[[raw/source]]\"\n---\n\n正文引用了 [[target]]。\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("wiki/orphan.md"),
+            "---\ntitle: \"Orphan Page\"\nlayer: wiki\nsources: [\"[[raw/source]]\"]\n---\n\n没有任何页面引用我。\n",
+        )
+        .unwrap();
+
+        let idx = VaultIndex::open(root.clone(), &root.join("index.sqlite"), vec![], "AGENTS.md")
+            .unwrap();
+        idx.rebuild().unwrap();
+
+        // `raw/source.md` is referenced by all 3 wiki pages via frontmatter `sources`
+        // (including the YAML block list in `wiki/referrer.md`).
+        let source_doc = idx.read("[[raw/source]]").unwrap();
+        let source_bl = source_doc["backlinks"].as_array().unwrap();
+        assert_eq!(source_bl.len(), 3, "expected 3 backlinks to raw/source, got {source_bl:?}");
+
+        // `wiki/target.md` is referenced by `wiki/referrer.md` in its body.
+        let target_doc = idx.read("[[target]]").unwrap();
+        let target_bl = target_doc["backlinks"].as_array().unwrap();
+        assert_eq!(target_bl.len(), 1);
+        assert_eq!(target_bl[0]["target"], "[[wiki/referrer]]");
+
+        // `wiki/referrer.md` and `wiki/orphan.md` have no incoming links; `wiki/target.md` does.
+        let orphans = idx.orphan_wiki_pages().unwrap();
+        assert_eq!(orphans, vec!["wiki/orphan.md", "wiki/referrer.md"]);
+
+        // Adding a body link from target -> orphan removes orphan incrementally via upsert.
+        std::fs::write(
+            root.join("wiki/target.md"),
+            "---\ntitle: \"Target Page\"\nlayer: wiki\nsources: [\"[[raw/source]]\"]\n---\n\n现在引用了 [[orphan]]。\n",
+        )
+        .unwrap();
+        assert!(idx.upsert("wiki/target.md").unwrap());
+        let orphans_after = idx.orphan_wiki_pages().unwrap();
+        assert_eq!(orphans_after, vec!["wiki/referrer.md"]);
     }
 }

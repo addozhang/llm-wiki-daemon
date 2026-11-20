@@ -121,10 +121,10 @@ new page has no link name yet.
 | Tool | Arguments | Purpose |
 | --- | --- | --- |
 | `vault_search` | `query, layer?, status?, limit?` | Weighted FTS5 + CJK trigram + substring fallback, fused by RRF rank; returns ready-to-feed `target`, a short `snippet` with `**highlighted**` matches, `score` (RRF, higher = better) and `bm25` (raw, per-index) |
-| `vault_read` | `target` | Standard fields, `frontmatter_all`, body, `version`, and resolved `links` |
+| `vault_read` | `target` | Standard fields, `frontmatter_all`, body, `version`, resolved `links`, and incoming `backlinks` |
 | `vault_resolve` | `targets[]` | Batch preview: metadata only, no body. Ambiguity gives `candidates[]` |
-| `vault_status` | — | Index counts, `link_refs`, `wiki_root`, mode, watcher counters |
-| `vault_lint` | `limit?` | Frontmatter health: missing / unclosed / duplicate keys, missing `title` / `layer` |
+| `vault_status` | — | Index counts, `link_refs`, `link_edges`, `wiki_root`, mode, watcher counters |
+| `vault_lint` | `limit?` | Frontmatter health (missing / unclosed / duplicate keys, missing `title` / `layer`) and orphan wiki pages (no incoming links) |
 | `vault_patch` | `target, part(frontmatter\|section\|end), key?, op(set\|append), value, expected_version` | Incremental edit |
 | `vault_append` | `target, text, expected_version, heading?` | Append at end or under a heading |
 | `vault_create` | `path, kind, sources[], summary, text?, title?, confidence?` | Bootstrap a new wiki page with verifiable provenance |

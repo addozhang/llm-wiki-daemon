@@ -114,7 +114,7 @@ impl VaultServer {
         }
     }
 
-    #[tool(description = "Read one note by an Obsidian wikilink ([[Note|alias]]), a bare note name, or a vault-relative path. Pass the wikilink verbatim - the daemon resolves it through its link index. Returns frontmatter, body, a version hash and `links` (each outgoing wikilink plus its indexed metadata). Ambiguous links return candidate targets to retry with.")]
+    #[tool(description = "Read one note by an Obsidian wikilink ([[Note|alias]]), a bare note name, or a vault-relative path. Pass the wikilink verbatim - the daemon resolves it through its link index. Returns frontmatter, body, a version hash, `links` (outgoing wikilinks + indexed metadata) and `backlinks` (notes referencing this page). Ambiguous links return candidate targets to retry with.")]
     async fn vault_read(
         &self,
         Parameters(req): Parameters<ReadRequest>,
@@ -226,7 +226,7 @@ impl VaultServer {
         store_result(self.store.rewrite(req).await)
     }
 
-    #[tool(description = "Read-only lint: missing frontmatter, unclosed frontmatter, duplicate keys and missing title/layer fields.")]
+    #[tool(description = "Read-only lint: missing frontmatter, unclosed frontmatter, duplicate keys, missing title/layer fields, and orphan wiki pages with no incoming links.")]
     async fn vault_lint(
         &self,
         Parameters(req): Parameters<LintRequest>,
